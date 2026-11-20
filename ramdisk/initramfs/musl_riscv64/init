@@ -1,4 +1,5 @@
 #!/busybox sh
+# NanoKVM initramfs init, stock + nkvm-ab A/B root slots with trial auto-revert
 
 export PATH=/
 
@@ -77,6 +78,34 @@ then
 	msc
 fi
 
+# ---------------- nkvm-ab: root slot selection (read while /boot is mounted) ----------------
+# /boot/nkvm.slot    permanent slot ("top" or absent = top level of p2, else /.nkvm-slot-<name>)
+# /boot/nkvm.try     one-shot trial slot: deleted HERE before it is booted, so any reboot,
+#                    panic, watchdog reset or power loss falls back to the permanent slot
+# /boot/nkvm.timeout seconds a trial may run unconfirmed (default 900)
+echo 10 > /proc/sys/kernel/panic        # never hang on panic: reboot after 10 s
+nkvm_mode=normal
+nkvm_slot=top
+nkvm_timeout=900
+nkvm_perm=top
+[ -e /boot/nkvm.slot ] && read nkvm_slot < /boot/nkvm.slot
+if [ -e /boot/nkvm.try ]
+then
+	read nkvm_try < /boot/nkvm.try
+	[ -e /boot/nkvm.timeout ] && read nkvm_timeout < /boot/nkvm.timeout
+	case "$nkvm_timeout" in ''|*[!0-9]*) nkvm_timeout=900 ;; esac
+	[ "$nkvm_timeout" -lt 60 ] && nkvm_timeout=60
+	# never boot a trial whose marker we could not remove
+	if mount -o remount,rw /boot && /busybox rm -f /boot/nkvm.try && sync && [ ! -e /boot/nkvm.try ]
+	then
+		nkvm_mode=trial
+		nkvm_perm=$nkvm_slot
+		nkvm_slot=$nkvm_try
+	else
+		echo "nkvm-ab: cannot consume /boot/nkvm.try - ignoring trial" > /dev/kmsg
+	fi
+fi
+
 umount /dev/mmcblk0p1
 
 flashkey0=$(cat /sys/kernel/debug/gpio | grep 'User Key' | grep lo | wc -l)
@@ -111,7 +140,83 @@ then
 	fi
 fi
 
-mount -t proc proc /realroot/proc
-mount -t sysfs sysfs /realroot/sys
-mount -t devtmpfs devtmpfs /realroot/dev
-exec switch_root /realroot /sbin/init
+# ---------------- nkvm-ab: pick the tree to boot ----------------
+nkvm_root=/realroot
+[ -n "$nkvm_slot" ] || nkvm_slot=top
+nkvm_slot_ok() {  # $1 = slot name; sets nkvm_root on success
+	[ "$1" = top ] && { nkvm_root=/realroot; return 0; }
+	case "$1" in ''|*[!a-zA-Z0-9_-]*) return 1 ;; esac
+	d=/realroot/.nkvm-slot-$1
+	[ -d "$d" ] && [ -e "$d/etc/inittab" ] && [ -e "$d/usr/bin/busybox" ] && [ -e "$d/sbin/init" ] || return 1
+	mkdir -p /newroot && mount --bind "$d" /newroot && nkvm_root=/newroot
+}
+if ! nkvm_slot_ok "$nkvm_slot"
+then
+	echo "nkvm-ab: slot '$nkvm_slot' missing or incomplete" > /dev/kmsg
+	if [ "$nkvm_mode" = trial ] && nkvm_slot_ok "$nkvm_perm"
+	then
+		nkvm_slot=$nkvm_perm
+	else
+		nkvm_slot=top; nkvm_root=/realroot
+	fi
+	nkvm_mode="fallback-$nkvm_mode"
+	echo "nkvm-ab: falling back to slot '$nkvm_slot'" > /dev/kmsg
+fi
+
+mount -t proc proc $nkvm_root/proc
+mount -t sysfs sysfs $nkvm_root/sys
+mount -t devtmpfs devtmpfs $nkvm_root/dev
+[ "$nkvm_root" = /newroot ] && umount /realroot
+# devtmpfs is one shared instance: this file is visible as /dev/.nkvm in the booted system
+echo "mode=$nkvm_mode slot=$nkvm_slot timeout=$nkvm_timeout" > /dev/.nkvm
+echo "nkvm-ab: mode=$nkvm_mode slot=$nkvm_slot" > /dev/kmsg
+
+# Trial watcher: started before switch_root, so it does not depend on anything in the trial
+# tree. Uses only shell builtins (its binary is deleted by switch_root). Feeds the HW
+# watchdog once the trial loads it (hang => reset in ~21 s). Without `nkvm-ab confirm`
+# (which creates /dev/.nkvm-confirmed) it reboots when the timeout expires.
+nkvm_watch() {
+	trap '' HUP INT TERM          # survive sysvinit's TERM round; only KILL stops us
+	exec </dev/null >/dev/null 2>&1
+	t=0
+	wd=0
+	feed() { [ $wd = 1 ] && echo 1 >&4; }
+	# persistent event log on the FAT partition (mounted at /boot inside the booted system)
+	log() { echo "nkvm-ab: $*" > /dev/kmsg; read up _ < /proc/uptime; [ -e /proc/1/root/boot/boot.sd ] && echo "boot+${up}s slot=$nkvm_slot $*" >> /proc/1/root/boot/nkvm.log; }
+	confirmed() {
+		[ -e /dev/.nkvm-confirmed ] || return 1
+		[ $wd = 1 ] && { printf V >&4; exec 4>&-; }
+		log "trial confirmed"
+		exit 0
+	}
+	while [ $t -lt $nkvm_timeout ]
+	do
+		confirmed
+		if [ $wd = 0 ] && [ -c /dev/watchdog ] && [ ! -e /dev/.nkvm-nowatchdog ]
+		then
+			command exec 4>/dev/watchdog && wd=1 && log "watchdog armed"
+		fi
+		feed
+		sleep 5
+		t=$((t + 5))
+		echo "$t" > /dev/.nkvm-elapsed
+	done
+	confirmed
+	log "trial NOT confirmed within ${nkvm_timeout}s - requesting reboot (initctl)"
+	# graceful: sysvinit 'telinit 6' request (struct init_request, magic 0x03091969, cmd RUNLVL, '6')
+	z=""; i=0; while [ $i -lt 368 ]; do z="$z\\000"; i=$((i + 1)); done
+	printf "\\151\\031\\011\\003\\001\\000\\000\\000\\066\\000\\000\\000\\005\\000\\000\\000$z" > /proc/1/root/run/initctl
+	t=0
+	while [ $t -lt 60 ]; do feed; sleep 5; t=$((t + 5)); done
+	# still running: forced but synced reboot
+	log "graceful reboot did not happen within 60s - sysrq s/u/b"
+	echo s > /proc/sysrq-trigger; feed; sleep 3
+	echo u > /proc/sysrq-trigger; feed; sleep 3
+	echo b > /proc/sysrq-trigger
+}
+if [ "$nkvm_mode" = trial ]
+then
+	nkvm_watch &
+fi
+
+exec switch_root $nkvm_root /sbin/init
